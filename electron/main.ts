@@ -12,6 +12,7 @@ function createWindow() {
         height: 800,
         minWidth: 800,
         minHeight: 600,
+        maxWidth: 1200,
         title: '小鸣同学',
         webPreferences: {
             nodeIntegration: false,

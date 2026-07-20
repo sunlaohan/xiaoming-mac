@@ -45,6 +45,9 @@ async function initBucket() {
 // User-specific cache for documents to speed up response
 const userDocsCache = new Map<string, { data: any[], timestamp: number }>();
 const DOCS_CACHE_TTL = 60 * 1000; // 1 minute cache
+const MAX_CONTEXT_DOCUMENTS = 3;
+const MAX_CONTEXT_CHARS_PER_DOCUMENT = 2000;
+const DOCUMENT_FETCH_TIMEOUT_MS = 1500;
 
 // Initialize bucket on startup
 initBucket();
@@ -102,6 +105,43 @@ function getSafeModelConfig(user: any) {
 
 function isModelConfigProviderError(status: number): boolean {
   return status === 401 || status === 403 || status === 404;
+}
+
+function getSearchTerms(message: string): string[] {
+  const terms = new Set<string>();
+  const segments = message.toLowerCase().match(/[\u4e00-\u9fff]{2,}|[a-z0-9]{2,}/g) || [];
+
+  for (const segment of segments) {
+    terms.add(segment);
+    if (/^[\u4e00-\u9fff]+$/.test(segment)) {
+      for (let index = 0; index < segment.length - 1; index += 1) {
+        terms.add(segment.slice(index, index + 2));
+      }
+    }
+  }
+
+  return [...terms].slice(0, 12);
+}
+
+async function fetchDocumentText(url: string): Promise<{ content: string; contentType: string } | null> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DOCUMENT_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) return null;
+    return {
+      content: await response.text(),
+      contentType: response.headers.get('content-type') || '',
+    };
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      console.error('Error fetching document content:', error);
+    }
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function movePrefixedData(oldPrefix: string, newPrefix: string): Promise<void> {
@@ -1014,44 +1054,35 @@ app.post("/make-server-8b373356/chat/send", async (c: Context) => {
       );
 
       if (mdDocs.length > 0) {
-        // Improved Relevance Scoring
-        const keywords = message.toLowerCase().split(/\s+/).filter(k => k.length > 1);
-        if (keywords.length > 0) {
-          mdDocs.sort((a, b) => {
-            let scoreA = 0;
-            let scoreB = 0;
-            const nameA = (a.name || '').toLowerCase();
-            const nameB = (b.name || '').toLowerCase();
+        // Score Chinese and English terms against document names before reading files.
+        // Keeping this small is important: Storage reads and prompt size dominate first-token latency.
+        const searchTerms = getSearchTerms(message);
+        const getDocumentScore = (doc: any) => {
+          const name = (doc.name || '').toLowerCase();
+          return searchTerms.reduce((score, term) => {
+            if (name === term) return score + 4;
+            return name.includes(term) ? score + 1 : score;
+          }, 0);
+        };
 
-            keywords.forEach(k => {
-              // Exact match gets 3 points
-              if (nameA === k) scoreA += 3;
-              if (nameB === k) scoreB += 3;
+        mdDocs.sort((a, b) => {
+          const scoreDifference = getDocumentScore(b) - getDocumentScore(a);
+          if (scoreDifference !== 0) return scoreDifference;
+          return new Date(b.uploadDate).getTime() - new Date(a.uploadDate).getTime();
+        });
 
-              // Contains match gets 1 point
-              if (nameA.includes(k)) scoreA += 1;
-              if (nameB.includes(k)) scoreB += 1;
-            });
-
-            // Primary sort by score (desc), Secondary by date (desc)
-            if (scoreA !== scoreB) return scoreB - scoreA;
-            return new Date(b.uploadDate).getTime() - new Date(a.uploadDate).getTime();
-          });
-        }
-
-        const docsToFetch = mdDocs.slice(0, 10); // Pick top 10 most relevant
+        const docsToFetch = mdDocs.slice(0, MAX_CONTEXT_DOCUMENTS);
         console.log(`Fetching contents for ${docsToFetch.length} documents...`);
 
         // Parallel Fetching
         const fetchPromises = docsToFetch.map(async (doc) => {
           try {
             if (doc.signedUrl) {
-              const response = await fetch(doc.signedUrl);
-              if (response.ok) {
-                let content = await response.text();
+              const documentText = await fetchDocumentText(doc.signedUrl);
+              if (documentText !== null) {
+                let { content, contentType } = documentText;
 
                 // If it's a link or HTML content, clean it up
-                const contentType = response.headers.get('content-type') || '';
                 if (doc.type === 'link' || contentType.includes('text/html')) {
                   // Remove scripts and styles
                   content = content.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gmi, "");
@@ -1064,9 +1095,8 @@ app.post("/make-server-8b373356/chat/send", async (c: Context) => {
                   content = content.replace(/\n\s*\n/g, '\n\n').trim();
                 }
 
-                // Limit content length to 5000 characters
-                const truncatedContent = content.length > 5000
-                  ? content.substring(0, 5000) + '\n...(内容已截断)'
+                const truncatedContent = content.length > MAX_CONTEXT_CHARS_PER_DOCUMENT
+                  ? content.substring(0, MAX_CONTEXT_CHARS_PER_DOCUMENT) + '\n...(内容已截断)'
                   : content;
                 return `### ${doc.name}\n${truncatedContent}`;
               }
@@ -1091,17 +1121,15 @@ app.post("/make-server-8b373356/chat/send", async (c: Context) => {
       }
     }
 
-    // Prepare enhanced system prompt
-    const systemPrompt = `你是小鸣同学，一个通用的智能助手。你的任务是为用户提供有帮助的回答。
+    const systemPrompt = `你是小鸣同学，一个快速、准确的知识库助手。
 
 请遵循以下规则：
-1. **优先回答用户的通用问题**，展现你的博学和多才多艺。
-2. 同时参考提供的【知识库文档】（如果有）。如果文档内容与用户问题相关，请结合文档进行回答。
-3. 如果用户问题与知识库无关，请直接基于你的通用知识进行回答，**不要**受限于知识库。
-4. 回答要自然、流畅、专业。
-${image ? '5. 你具备视觉分析能力，请仔细分析用户上传的图片内容并结合上下文回答问题' : ''}
+1. 优先依据【知识库片段】直接回答；片段不足以支撑答案时，明确说明未找到相关信息。
+2. 回答先给结论，默认控制在 3 个要点或 150 字以内；除非用户明确要求，不展开推理过程或补充背景。
+3. 不猜测知识库中没有的信息。
+${image ? '4. 用户上传图片时，简洁说明图片中的关键信息。' : ''}
 
-当前可参考的知识库片段（仅供参考，非必须）：
+当前可参考的知识库片段：
 ${knowledgeBaseContext}`;
 
     const user = await kv.get(`user:${username}`);
@@ -1152,7 +1180,8 @@ ${knowledgeBaseContext}`;
               model: modelToUse,
               messages: messages,
               stream: true,
-              temperature: 0.3
+              temperature: 0.2,
+              max_tokens: 512
             }),
           });
 
